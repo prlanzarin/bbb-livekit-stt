@@ -81,8 +81,31 @@ _FINAL_DRAIN_TIMEOUT_S = 3.0
 _OPEN_GATE_TIMEOUT_S = float(os.getenv("VOXTRAL_OPEN_GATE_TIMEOUT_S", "10.0"))
 
 
+# Key under which the prewarmed VAD is stashed in the worker process's
+# userdata. Namespaced because the dict is shared with anything else the
+# process prewarms.
+VAD_USERDATA_KEY = "voxtral_realtime_vad"
+
+
 class _HandshakeError(Exception):
     """The upgrade succeeded but the server did not answer with session.created."""
+
+
+def _load_vad() -> agents_vad.VAD:
+    return silero.VAD.load(
+        min_silence_duration=_VAD_MIN_SILENCE_S,
+        activation_threshold=_VAD_ACTIVATION_THRESHOLD,
+    )
+
+
+def prewarm(userdata: dict) -> None:
+    """Load the Silero model once per worker process, before any job arrives.
+
+    Called from the LiveKit worker's prewarm hook. Loading it lazily in the
+    agent constructor instead would run once per room, synchronously on the
+    job's event loop, and keep one copy of the model per concurrent job.
+    """
+    userdata[VAD_USERDATA_KEY] = _load_vad()
 
 
 @dataclass
@@ -122,10 +145,13 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 "(the URL of your vLLM server, e.g. https://your-server:8000/v1)."
             )
         self._http_session: aiohttp.ClientSession | None = None
-        self._vad: agents_vad.VAD = vad or silero.VAD.load(
-            min_silence_duration=_VAD_MIN_SILENCE_S,
-            activation_threshold=_VAD_ACTIVATION_THRESHOLD,
-        )
+        if vad is None:
+            # Normally supplied by prewarm(); loading here is the fallback for
+            # a worker started without the hook, and costs the job the model
+            # load on its own event loop.
+            logging.debug("Voxtral: no prewarmed VAD supplied, loading inline.")
+            vad = _load_vad()
+        self._vad: agents_vad.VAD = vad
 
     def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None:
