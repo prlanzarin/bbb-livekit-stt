@@ -54,6 +54,10 @@ _SPLIT_OVERLAP_S = float(os.getenv("VOXTRAL_SPLIT_OVERLAP_S", "1.5"))
 # Reconnect backoff bounds for a dropped WebSocket connection.
 _RETRY_DELAY_INITIAL_S = 1.0
 _RETRY_DELAY_MAX_S = 30.0
+# WebSocket ping interval. A half-open connection (server killed without a
+# FIN, idle NAT/load-balancer drop) leaves the reader blocked in receive()
+# indefinitely, so aiohttp has to detect the loss for us.
+_WS_HEARTBEAT_S = 20.0
 # After the audio stream ends, wait up to this long for the server's
 # transcription.done of the final segment before tearing the reader down;
 # cancelling it immediately would drop the tail utterance's FINAL.
@@ -190,7 +194,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                 audio_stream = rtc.AudioStream(track)
                 try:
                     async with self._get_http_session().ws_connect(
-                        ws_url, headers=headers
+                        ws_url, headers=headers, heartbeat=_WS_HEARTBEAT_S
                     ) as ws:
                         msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                         if msg.type != aiohttp.WSMsgType.TEXT:
