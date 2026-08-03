@@ -128,7 +128,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         return f"{base}/realtime?intent=transcription"
 
-    def _create_stt_stream(self, locale: str) -> stt.SpeechStream:
+    def _create_stt_stream(self, locale: str | None) -> stt.SpeechStream:
         raise NotImplementedError("VoxtralRealtime uses a custom pipeline")
 
     def _update_stream_locale(self, user_id: str, locale: str):
@@ -178,11 +178,11 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             await self._http_session.close()
             self._http_session = None
 
-    async def _run_transcription_pipeline(
+    async def _run_transcription_pipeline(  # type: ignore[override]
         self,
         participant: rtc.RemoteParticipant,
         track: rtc.Track,
-        language: str,
+        language: str | None,
     ):
         ws_url = self._build_ws_url()
         # A vLLM server started without VLLM_API_KEY takes anonymous requests,
@@ -282,7 +282,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         ws: aiohttp.ClientWebSocketResponse,
         audio_stream: rtc.AudioStream,
         participant: rtc.RemoteParticipant,
-        language: str,
+        language: str | None,
         open_time: float,
     ):
         chunk_size = (
