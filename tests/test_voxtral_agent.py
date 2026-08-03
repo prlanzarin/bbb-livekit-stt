@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -340,31 +341,63 @@ class TestCleanup:
 # ── _run_transcription_pipeline — early exit paths ────────────────────────────
 
 
+def _binary_ws_msg() -> MagicMock:
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.BINARY
+    return msg
+
+
+def _closed_ws_msg() -> MagicMock:
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.CLOSED
+    return msg
+
+
+def _raw_text_ws_msg(raw: str) -> MagicMock:
+    """A TEXT frame whose payload is not valid JSON."""
+    msg = MagicMock()
+    msg.type = aiohttp.WSMsgType.TEXT
+    msg.data = raw
+    return msg
+
+
+# A connection whose handshake succeeds; the reader then sees the socket close.
+_GOOD_HANDSHAKE = [_text_ws_msg({"type": "session.created"}), _closed_ws_msg()]
+
+
 class TestRunTranscriptionPipeline:
-    def _ws_context(self, first_message):
-        """Build an async context manager that yields a mock WS with one receive."""
+    @pytest.fixture(autouse=True)
+    def _no_backoff_sleeps(self, monkeypatch):
+        """Keep the reconnect backoff from adding real seconds to the suite."""
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._RETRY_DELAY_INITIAL_S", 0.0, raising=True
+        )
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._RETRY_DELAY_MAX_S", 0.0, raising=True
+        )
+
+    def _ws_context(self, messages):
+        """An async context manager yielding a WS that replays `messages`."""
         mock_ws = AsyncMock()
-        mock_ws.receive = AsyncMock(return_value=first_message)
+        mock_ws.receive = AsyncMock(side_effect=list(messages))
         mock_ws.send_json = AsyncMock()
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=mock_ws)
         cm.__aexit__ = AsyncMock(return_value=False)
         return cm
 
-    def _mock_session(self, first_message):
+    def _mock_session(self, *connections):
+        """One entry per expected ws_connect call, each a list of WS messages."""
         session = MagicMock()
-        session.ws_connect = MagicMock(return_value=self._ws_context(first_message))
+        session.ws_connect = MagicMock(
+            side_effect=[self._ws_context(msgs) for msgs in connections]
+        )
         return session
 
-    async def test_exits_cleanly_on_non_text_first_message(self, caplog):
-        agent = _make_agent()
+    async def _run(self, agent, *connections):
         participant = MagicMock(spec=rtc.RemoteParticipant)
         participant.identity = "user_1"
-
-        binary_msg = MagicMock()
-        binary_msg.type = aiohttp.WSMsgType.BINARY
-
-        agent._http_session = self._mock_session(binary_msg)
+        agent._http_session = self._mock_session(*connections)
 
         mock_stream = AsyncMock()
         mock_stream.__aiter__.return_value = iter([])
@@ -376,32 +409,24 @@ class TestRunTranscriptionPipeline:
             await agent._run_transcription_pipeline(participant, MagicMock(), "en")
 
         assert "user_1" not in agent.processing_info
+        return agent._http_session.ws_connect
 
-    async def _connect_once(self, agent):
-        """Run the pipeline far enough to capture the ws_connect call."""
-        participant = MagicMock(spec=rtc.RemoteParticipant)
-        participant.identity = "user_1"
-        # A non-TEXT first frame ends the pipeline right after connecting.
-        binary_msg = MagicMock()
-        binary_msg.type = aiohttp.WSMsgType.BINARY
-        agent._http_session = self._mock_session(binary_msg)
+    # --- Authorization header ---
 
-        mock_stream = AsyncMock()
-        mock_stream.__aiter__.return_value = iter([])
-        mock_stream.aclose = AsyncMock()
+    async def _connect_once(self, agent, monkeypatch):
+        # Give up on the first bad handshake so the pipeline makes exactly one
+        # connection attempt and we can inspect its arguments.
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._HANDSHAKE_GIVE_UP_S", 0.0, raising=True
+        )
+        ws_connect = await self._run(agent, [_binary_ws_msg()])
+        return ws_connect.call_args.kwargs["headers"]
 
-        with patch(
-            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
-        ):
-            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
-
-        return agent._http_session.ws_connect.call_args.kwargs["headers"]
-
-    async def test_sends_bearer_header_when_api_key_is_set(self):
-        headers = await self._connect_once(_make_agent())
+    async def test_sends_bearer_header_when_api_key_is_set(self, monkeypatch):
+        headers = await self._connect_once(_make_agent(), monkeypatch)
         assert headers["Authorization"] == "Bearer test-key"
 
-    async def test_omits_authorization_header_when_no_api_key(self):
+    async def test_omits_authorization_header_when_no_api_key(self, monkeypatch):
         # Servers without VLLM_API_KEY take anonymous requests; sending
         # "Bearer None" would be rejected by an auth proxy in front of them.
         agent = VoxtralRealtimeSttAgent(
@@ -410,27 +435,50 @@ class TestRunTranscriptionPipeline:
             ),
             vad=_make_mock_vad(),
         )
-        assert "Authorization" not in await self._connect_once(agent)
+        assert "Authorization" not in await self._connect_once(agent, monkeypatch)
 
-    async def test_exits_cleanly_on_wrong_first_message_type(self, caplog):
-        agent = _make_agent()
-        participant = MagicMock(spec=rtc.RemoteParticipant)
-        participant.identity = "user_1"
+    # --- Handshake failures are retried, not fatal ---
+    #
+    # Returning on a bad handshake would end transcription for the rest of the
+    # meeting: nothing re-arms the pipeline, since _on_track_subscribed only
+    # fires for a track that is not already subscribed.
 
-        agent._http_session = self._mock_session(
-            _text_ws_msg({"type": "session.error"})  # not "session.created"
+    async def test_retries_after_non_text_first_message(self):
+        ws_connect = await self._run(_make_agent(), [_binary_ws_msg()], _GOOD_HANDSHAKE)
+        assert ws_connect.call_count == 2
+
+    async def test_retries_after_wrong_first_message_type(self):
+        ws_connect = await self._run(
+            _make_agent(),
+            [_text_ws_msg({"type": "session.error"})],  # not "session.created"
+            _GOOD_HANDSHAKE,
         )
+        assert ws_connect.call_count == 2
 
-        mock_stream = AsyncMock()
-        mock_stream.__aiter__.return_value = iter([])
-        mock_stream.aclose = AsyncMock()
+    async def test_retries_after_malformed_first_message(self):
+        ws_connect = await self._run(
+            _make_agent(),
+            [_raw_text_ws_msg("<html>502 Bad Gateway</html>")],
+            _GOOD_HANDSHAKE,
+        )
+        assert ws_connect.call_count == 2
 
-        with patch(
-            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
-        ):
-            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
+    async def test_gives_up_once_the_handshake_budget_is_spent(
+        self, monkeypatch, caplog
+    ):
+        # A server that never speaks the protocol — wrong URL, or not vLLM.
+        # Retrying forever would hide the misconfiguration.
+        monkeypatch.setattr(
+            "providers.voxtral_realtime._HANDSHAKE_GIVE_UP_S", 0.0, raising=True
+        )
+        with caplog.at_level(logging.ERROR):
+            ws_connect = await self._run(
+                _make_agent(), [_text_ws_msg({"type": "session.error"})]
+            )
 
-        assert "user_1" not in agent.processing_info
+        assert ws_connect.call_count == 1
+        assert "giving up" in caplog.text
+        assert "VOXTRAL_BASE_URL" in caplog.text
 
 
 # ── _vad_loop — speech detection and final flush ──────────────────────────────

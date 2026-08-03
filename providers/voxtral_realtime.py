@@ -58,6 +58,13 @@ _RETRY_DELAY_MAX_S = 30.0
 # FIN, idle NAT/load-balancer drop) leaves the reader blocked in receive()
 # indefinitely, so aiohttp has to detect the loss for us.
 _WS_HEARTBEAT_S = 20.0
+# How long to keep retrying a handshake that connects but answers with
+# something other than session.created. The budget has to outlast vLLM's
+# 2–5 min of CUDA-graph warmup, during which the server may reject or error on
+# the upgrade; past it, a handshake that still fails is a misconfiguration —
+# wrong URL, or a server that does not speak vLLM's realtime protocol — and no
+# amount of further retrying will fix it.
+_HANDSHAKE_GIVE_UP_S = 600.0
 # After the audio stream ends, wait up to this long for the server's
 # transcription.done of the final segment before tearing the reader down;
 # cancelling it immediately would drop the tail utterance's FINAL.
@@ -72,6 +79,10 @@ _FINAL_DRAIN_TIMEOUT_S = 3.0
 # the wait when a done never arrives (already-desynced session): give up,
 # resync the counter, and open ungated as before.
 _OPEN_GATE_TIMEOUT_S = float(os.getenv("VOXTRAL_OPEN_GATE_TIMEOUT_S", "10.0"))
+
+
+class _HandshakeError(Exception):
+    """The upgrade succeeded but the server did not answer with session.created."""
 
 
 @dataclass
@@ -196,6 +207,10 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         open_time = time.time()
         self.open_time = open_time
         retry_delay = _RETRY_DELAY_INITIAL_S
+        # Monotonic timestamp of the first handshake failure in the current
+        # streak; cleared whenever a handshake succeeds, so a long meeting with
+        # occasional reconnects never accumulates its way to the give-up bound.
+        handshake_failing_since: float | None = None
 
         try:
             while True:
@@ -206,21 +221,24 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     ) as ws:
                         msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                         if msg.type != aiohttp.WSMsgType.TEXT:
-                            logging.error(
-                                "Voxtral WS: expected text for session.created"
+                            raise _HandshakeError(
+                                f"expected TEXT for session.created, got {msg.type}"
                             )
-                            return
-                        data = json.loads(msg.data)
+                        try:
+                            data = json.loads(msg.data)
+                        except (ValueError, TypeError) as e:
+                            raise _HandshakeError(
+                                f"malformed first message: {e}"
+                            ) from e
                         if data.get("type") != "session.created":
-                            logging.error(
-                                f"Voxtral WS: unexpected first message: {data}"
-                            )
-                            return
+                            raise _HandshakeError(f"unexpected first message: {data}")
                         logging.info(
                             f"Voxtral WS session created for {participant.identity}"
                         )
-                        # Connection is healthy again; reset reconnect backoff.
+                        # Connection is healthy again; reset reconnect backoff
+                        # and the handshake give-up streak.
                         retry_delay = _RETRY_DELAY_INITIAL_S
+                        handshake_failing_since = None
 
                         # vLLM expects a FLAT session.update — model and
                         # temperature at the top level; nesting under
@@ -242,11 +260,40 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
 
                 except asyncio.CancelledError:
                     raise
+                except _HandshakeError as e:
+                    # Retrying is what makes a server that is still warming up
+                    # survivable. Returning here instead would end this
+                    # participant's transcription for the rest of the meeting:
+                    # nothing re-arms the pipeline, because _on_track_subscribed
+                    # only fires for a track that is not already subscribed.
+                    now = time.monotonic()
+                    if handshake_failing_since is None:
+                        handshake_failing_since = now
+                    if now - handshake_failing_since >= _HANDSHAKE_GIVE_UP_S:
+                        logging.error(
+                            f"Voxtral WS handshake still failing for "
+                            f"{participant.identity} after "
+                            f"{_HANDSHAKE_GIVE_UP_S:.0f}s ({e}) — giving up. "
+                            f"Check that VOXTRAL_BASE_URL points at a vLLM "
+                            f"server serving the realtime API: {ws_url}"
+                        )
+                        return
+                    logging.warning(
+                        f"Voxtral WS handshake failed for {participant.identity} "
+                        f"({e}), retrying in {retry_delay:.0f}s"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, _RETRY_DELAY_MAX_S)
                 except (TimeoutError, aiohttp.ClientError, ConnectionResetError) as e:
                     # TimeoutError covers a slow session.created handshake —
                     # vLLM takes 2–5 min of CUDA-graph warmup after startup,
                     # during which giving up permanently would cost the
                     # participant the whole meeting. Retry with backoff.
+                    # Deliberately unbounded, unlike _HandshakeError: a
+                    # transport failure is as likely to be the server
+                    # restarting mid-meeting as a permanent misconfiguration,
+                    # and a reachable-but-silent endpoint costs one connect
+                    # attempt every _RETRY_DELAY_MAX_S.
                     logging.warning(
                         f"Voxtral WS connection lost for {participant.identity} "
                         f"({type(e).__name__}: {e}), reconnecting in {retry_delay:.0f}s"
