@@ -377,6 +377,41 @@ class TestRunTranscriptionPipeline:
 
         assert "user_1" not in agent.processing_info
 
+    async def _connect_once(self, agent):
+        """Run the pipeline far enough to capture the ws_connect call."""
+        participant = MagicMock(spec=rtc.RemoteParticipant)
+        participant.identity = "user_1"
+        # A non-TEXT first frame ends the pipeline right after connecting.
+        binary_msg = MagicMock()
+        binary_msg.type = aiohttp.WSMsgType.BINARY
+        agent._http_session = self._mock_session(binary_msg)
+
+        mock_stream = AsyncMock()
+        mock_stream.__aiter__.return_value = iter([])
+        mock_stream.aclose = AsyncMock()
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
+
+        return agent._http_session.ws_connect.call_args.kwargs["headers"]
+
+    async def test_sends_bearer_header_when_api_key_is_set(self):
+        headers = await self._connect_once(_make_agent())
+        assert headers["Authorization"] == "Bearer test-key"
+
+    async def test_omits_authorization_header_when_no_api_key(self):
+        # Servers without VLLM_API_KEY take anonymous requests; sending
+        # "Bearer None" would be rejected by an auth proxy in front of them.
+        agent = VoxtralRealtimeSttAgent(
+            VoxtralRealtimeConfig(
+                api_key=None, base_url="https://test-server.example.com/v1"
+            ),
+            vad=_make_mock_vad(),
+        )
+        assert "Authorization" not in await self._connect_once(agent)
+
     async def test_exits_cleanly_on_wrong_first_message_type(self, caplog):
         agent = _make_agent()
         participant = MagicMock(spec=rtc.RemoteParticipant)

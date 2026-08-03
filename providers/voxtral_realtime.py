@@ -185,7 +185,14 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         language: str,
     ):
         ws_url = self._build_ws_url()
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        # A vLLM server started without VLLM_API_KEY takes anonymous requests,
+        # so an unset key means "send no credentials" — not "send the string
+        # None", which any auth proxy in front would reject outright.
+        headers = (
+            {"Authorization": f"Bearer {self.config.api_key}"}
+            if self.config.api_key
+            else {}
+        )
         open_time = time.time()
         retry_delay = _RETRY_DELAY_INITIAL_S
 
