@@ -194,6 +194,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             else {}
         )
         open_time = time.time()
+        self.open_time = open_time
         retry_delay = _RETRY_DELAY_INITIAL_S
 
         try:
