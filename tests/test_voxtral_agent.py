@@ -608,6 +608,38 @@ class TestVadLoop:
         assert interim[0]["event"].type == stt.SpeechEventType.INTERIM_TRANSCRIPT
         assert len(final) == 1
 
+    async def test_empty_deltas_do_not_reemit_the_same_interim(self):
+        """
+        Deltas carrying no text must not re-emit the previous interim.
+
+        vLLM streams one transcription.delta per decoded frame, and the frames
+        after the last word of a segment carry an empty delta until the segment
+        closes. Emitting on each of them republishes identical text under the
+        same BBB transcriptId dozens of times per utterance.
+        """
+        loud = _make_loud_frame()
+        agent, participant, mock_stream = self._full_pipeline_setup(
+            audio_frames=[loud],
+            ws_messages=[
+                _text_ws_msg({"type": "transcription.delta", "delta": "hi"}),
+                _text_ws_msg({"type": "transcription.delta", "delta": ""}),
+                _text_ws_msg({"type": "transcription.delta", "delta": ""}),
+                _text_ws_msg({"type": "transcription.done", "text": "hi"}),
+            ],
+        )
+
+        interim = []
+        agent.on("interim_transcript", lambda **kw: interim.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await agent._run_transcription_pipeline(participant, MagicMock(), "en")
+        await asyncio.sleep(0)
+
+        texts = [kw["event"].alternatives[0].text for kw in interim]
+        assert texts == ["hi"], f"expected one interim per text change, got {texts}"
+
     async def test_two_utterances_emit_two_finals_with_independent_text(self):
         """
         Two speech→silence cycles produce two independent FINAL transcripts.

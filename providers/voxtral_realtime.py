@@ -378,6 +378,13 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         # showing the already-emitted interim as pending forever.
         seg_text = ""
         seg_start: float | None = None
+        # Text of the last INTERIM emitted for the in-flight segment. vLLM
+        # streams one transcription.delta per decoded frame and the frames that
+        # decode to nothing carry an empty delta, so a segment ends with a run
+        # of deltas that leave seg_text untouched — emitting on each of them
+        # republishes identical text under the same BBB transcriptId dozens of
+        # times per utterance.
+        last_interim = ""
 
         # Segments opened whose transcription.done has not been read yet.
         # Incremented by _writer._open(), decremented by _reader on done.
@@ -432,7 +439,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
             emitted by the server while audio is still streaming are consumed
             in real time rather than buffered and replayed after each commit.
             """
-            nonlocal seg_text, seg_start, outstanding
+            nonlocal seg_text, seg_start, outstanding, last_interim
 
             while True:
                 try:
@@ -483,7 +490,12 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                             f"(seg_start={seg_start:.3f}s)"
                         )
                     seg_text += data.get("delta", "")
-                    if seg_text and self.config.interim_results:
+                    if (
+                        seg_text
+                        and seg_text != last_interim
+                        and self.config.interim_results
+                    ):
+                        last_interim = seg_text
                         _emit_transcript(False, seg_text, seg_start)
 
                 elif msg_type == "transcription.done":
@@ -512,6 +524,7 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                     # Reset for next utterance
                     seg_text = ""
                     seg_start = None
+                    last_interim = ""
 
                 elif msg_type == "error":
                     logging.error(f"Voxtral WS error event: {data}")
