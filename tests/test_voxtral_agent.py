@@ -305,6 +305,26 @@ class TestStartTranscriptionForUser:
         assert mock_pipeline.call_args[0][2] == "pt"
         agent.processing_info.pop("user_1", None)
 
+    async def test_auto_locale_reaches_the_pipeline_as_none(self):
+        """
+        "auto" sanitizes to None, which is how a provider is told to detect the
+        language server-side. Voxtral never sends a language to vLLM, so the
+        None also means the emitted transcripts carry no language — see
+        test_auto_locale_emits_transcripts_with_no_language and the README's
+        note that "auto" is not usable with this provider.
+        """
+        participant = _make_participant("user_1")
+        agent = _make_agent_with_room(participants={"p1": participant})
+
+        with patch.object(
+            agent, "_run_transcription_pipeline", new_callable=AsyncMock
+        ) as mock_pipeline:
+            agent.start_transcription_for_user("user_1", "auto", "voxtral-realtime")
+            await asyncio.sleep(0)
+
+        assert mock_pipeline.call_args[0][2] is None
+        agent.processing_info.pop("user_1", None)
+
     async def test_settings_stored_on_start(self):
         participant = _make_participant("user_1")
         agent = _make_agent_with_room(participants={"p1": participant})
@@ -639,6 +659,39 @@ class TestVadLoop:
 
         texts = [kw["event"].alternatives[0].text for kw in interim]
         assert texts == ["hi"], f"expected one interim per text change, got {texts}"
+
+    async def test_auto_locale_emits_transcripts_with_no_language(self):
+        """
+        Under "auto" the provider has no language to report: vLLM is never told
+        which one to expect (session.update carries only model and temperature)
+        and nothing reads a detected one back. main.py then has no BBB locale to
+        publish under and discards the transcript, which is why the README tells
+        users to set an explicit locale with this provider.
+        """
+        loud = _make_loud_frame()
+        agent, participant, mock_stream = self._full_pipeline_setup(
+            audio_frames=[loud],
+            ws_messages=[
+                _text_ws_msg({"type": "transcription.delta", "delta": "hallo"}),
+                _text_ws_msg({"type": "transcription.done", "text": "hallo"}),
+            ],
+        )
+
+        interim = []
+        final = []
+        agent.on("interim_transcript", lambda **kw: interim.append(kw))
+        agent.on("final_transcript", lambda **kw: final.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream", return_value=mock_stream
+        ):
+            await agent._run_transcription_pipeline(participant, MagicMock(), None)
+        await asyncio.sleep(0)
+
+        assert len(final) == 1
+        assert final[0]["event"].alternatives[0].language is None
+        assert interim, "expected at least one interim to check as well"
+        assert all(kw["event"].alternatives[0].language is None for kw in interim)
 
     async def test_two_utterances_emit_two_finals_with_independent_text(self):
         """

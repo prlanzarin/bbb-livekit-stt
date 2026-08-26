@@ -165,9 +165,15 @@ VOXTRAL_API_KEY=your-key                            # if your server enforces on
 VAD and segmentation tuning options (silence duration, pre-roll, split
 overlap, max segment length) are documented in `.env.example`.
 
-> **Note**: Voxtral Realtime does not support real-time translation. Only the
-> original transcript language is returned, matching the user's BBB speech
-> locale.
+Some caveats apply to this provider:
+
+- It does not support real-time translation. Only the original transcript
+  language is returned, matching the user's BBB speech locale.
+- The `auto` speech locale is not usable with it. The agent never tells vLLM
+  which language to expect, and it does not read a detected one back from the
+  realtime events, so there is no detected language to map back to a BBB locale
+  and every transcript — interim and final — is discarded with a warning. Set an
+  explicit locale in BBB when using Voxtral Realtime STT.
 
 ### Development
 
