@@ -63,8 +63,10 @@ dependencies, run the agent, and run tests.
     `_run_transcription_pipeline()` wholesale and raises `NotImplementedError` from
     `_create_stt_stream()`, but it segments speech with a Silero VAD (loaded once
     per worker process via `prewarm()`) and streams audio while a request is open,
-    so it emits live interims. No confidence filtering, no translation, and
-    `"auto"` is not usable — see the README's caveats.
+    so it emits live interims. No confidence filtering, no translation, and no
+    language in either direction — vLLM's realtime API has no field to request
+    one and reports none back, so `"auto"` is not usable and a transcript is
+    labelled with the locale the participant selected. See the README's caveats.
 - **`config.py`** — `RedisConfig` + the `redis_config` singleton, the `stt_provider`
   env var, env-var helpers (`_get_float_env`, `_get_bool_env`, …), and startup
   config redaction. Provider configs live in `providers/`, not here.

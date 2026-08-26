@@ -1,11 +1,16 @@
 """STT provider for vLLM's Voxtral Realtime WebSocket API.
 
-vLLM's protocol differs from the OpenAI Realtime Transcription API in three ways:
-- session.update: model is at the top level, not nested inside session.audio
+vLLM's protocol differs from the OpenAI Realtime Transcription API in four ways:
+- session.update: model is at the top level, not nested inside session.audio.
+  It is also the ONLY field vLLM reads — its handler does event.get("model")
+  and ignores the rest of the payload
+  (vllm/entrypoints/speech_to_text/realtime/connection.py, handle_event).
 - No server-side VAD: the client segments speech itself — a bare
   input_audio_buffer.commit opens a streaming request, commit(final: true)
   closes it (verified in notes/progressive-transcription-investigation.md)
 - Response events: transcription.delta / transcription.done (not conversation.item.*)
+- No language, in either direction. There is no field to request one and none
+  is reported back; see _vad_loop's `language` parameter for why.
 
 Audio must be PCM16, 16 kHz, mono, base64-encoded.
 """
@@ -266,11 +271,17 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                         retry_delay = _RETRY_DELAY_INITIAL_S
                         handshake_failing_since = None
 
-                        # vLLM expects a FLAT session.update — model and
-                        # temperature at the top level; nesting under
-                        # "session" is rejected (probe test 6). The model
-                        # card mandates temperature 0.0: greedy decoding is
-                        # required for stable transcription.
+                        # vLLM expects a FLAT session.update: its handler
+                        # reads event.get("model") off the top level, so
+                        # nesting under "session" fails validation with
+                        # "Missing required field: model" (probe test 6).
+                        # model is also the only field it reads — the
+                        # SessionUpdate model declares nothing else, and the
+                        # server hardcodes temperature=0.0 for every realtime
+                        # generation, which is the greedy decoding the model
+                        # card requires. temperature is sent anyway: it is
+                        # ignored today and correct if the field is ever
+                        # honoured.
                         await ws.send_json(
                             {
                                 "type": "session.update",
@@ -358,6 +369,18 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
         language: str | None,
         open_time: float,
     ):
+        # `language` only labels the transcripts this pipeline emits; it is
+        # never sent to the server, because there is nowhere to send it. vLLM's
+        # SessionUpdate carries only `type` and `model`, and its realtime prompt
+        # is tokenizer.instruct.start() + audio_encoder.encode_streaming_tokens()
+        # — mistral_common encodes a "lang:<code>" prefix only in
+        # _encode_instruct_transcription, the offline format; the streaming one
+        # never reads request.language. Nothing comes back either:
+        # transcription.delta carries `delta` and transcription.done carries
+        # `text` and `usage`, neither a detected language. So Voxtral Realtime
+        # always auto-detects, this label is the locale the participant asked
+        # for, and "auto" (language None) means main.py has nothing to resolve a
+        # BBB locale from and drops the transcript. See the README's caveats.
         chunk_size = (
             _TARGET_SAMPLE_RATE // 20 * 2
         )  # 50 ms of int16 (matches official plugin)

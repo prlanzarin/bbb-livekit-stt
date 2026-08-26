@@ -169,10 +169,16 @@ Some caveats apply to this provider:
 
 - It does not support real-time translation. Only the original transcript
   language is returned, matching the user's BBB speech locale.
-- The `auto` speech locale is not usable with it. The agent never tells vLLM
-  which language to expect, and it does not read a detected one back from the
-  realtime events, so there is no detected language to map back to a BBB locale
-  and every transcript — interim and final — is discarded with a warning. Set an
+- The `auto` speech locale is not usable with it, and the participant's chosen
+  locale never reaches the model either. vLLM's realtime API carries no language
+  in either direction: `session.update` accepts only `model`, and
+  `transcription.delta` / `transcription.done` report only text. The limitation
+  is in the model's streaming prompt format, not just the API — a target
+  language is encoded as a `lang:<code>` prefix only in the offline
+  transcription format, never in the streaming one. Voxtral Realtime therefore
+  always detects the language itself, transcripts are labelled with the locale
+  the participant selected, and under `auto` there is no language at all, so
+  every transcript — interim and final — is discarded with a warning. Set an
   explicit locale in BBB when using Voxtral Realtime STT.
 
 ### Development
