@@ -1446,6 +1446,80 @@ class TestCommitGate:
             "after the gate timeout the next segment must still open"
         )
 
+    async def test_gate_timeout_discards_the_unpaired_segment_start(self, monkeypatch):
+        """
+        The gate timeout must drop the starts of the segments it gave up on.
+
+        The timeout exists for a commit vLLM silently ignored: that segment
+        produces neither a delta nor a done, so its queued start is never
+        popped. Resyncing `outstanding` without draining the queue leaves the
+        start behind, and the next segment — and every one after it, for the
+        life of the connection — is stamped with its predecessor's start time,
+        which is the BBB transcriptId. Nothing logs it: _pop_segment_start
+        warns on an empty queue, never an over-full one.
+
+        The clock is faked at 10 s per reading so the two candidate stamps are
+        far apart: the dropped segment's start is one step after open_time
+        (~10 s), the segment that actually streams is several steps later.
+        """
+        import providers.voxtral_realtime as vr
+
+        monkeypatch.setattr(vr, "_MAX_BUFFER_DURATION_S", 0.015)
+        monkeypatch.setattr(vr, "_OPEN_GATE_TIMEOUT_S", 0.0)
+
+        clock = [0.0]
+
+        def _fake_time():
+            clock[0] += 10.0
+            return clock[0]
+
+        monkeypatch.setattr(vr.time, "time", _fake_time)
+
+        vad_stream = _ScheduledVadStream([(1, agents_vad.VADEventType.START_OF_SPEECH)])
+        mock_vad = MagicMock()
+        mock_vad.stream.return_value = vad_stream
+        agent = VoxtralRealtimeSttAgent(_make_config(), vad=mock_vad)
+
+        frames = [_make_audio_frame(amplitude=100 + i) for i in range(8)]
+        # No transcription events for the first segment — its opener was
+        # dropped. Both events arrive only once a second segment has opened.
+        script = [
+            (lambda: True, _text_ws_msg({"type": "session.created"}), False),
+            (
+                lambda: len(self._openers(sent)) >= 2,
+                _text_ws_msg({"type": "transcription.delta", "delta": "hi"}),
+                False,
+            ),
+            (
+                lambda: len(self._openers(sent)) >= 2,
+                _text_ws_msg({"type": "transcription.done", "text": "hi"}),
+                False,
+            ),
+        ]
+        participant, mock_stream, sent = self._wire(agent, frames, script)
+
+        final = []
+        agent.on("final_transcript", lambda **kw: final.append(kw))
+
+        with patch(
+            "providers.voxtral_realtime.rtc.AudioStream",
+            return_value=mock_stream,
+        ):
+            await asyncio.wait_for(
+                agent._run_transcription_pipeline(participant, MagicMock(), "en"),
+                timeout=5.0,
+            )
+        await asyncio.sleep(0)
+
+        assert len(self._openers(sent)) >= 2, "the gate timeout must still reopen"
+        assert len(final) == 1
+        start_time = final[0]["event"].alternatives[0].start_time
+        assert start_time > 10.0, (
+            f"the streaming segment was stamped {start_time:.1f}s, the start "
+            f"queued for the segment the gate gave up on — the resync must "
+            f"discard unpaired segment starts, not just the counter"
+        )
+
 
 # ── Failure recovery and teardown flush ────────────────────────────────────────
 

@@ -771,10 +771,30 @@ class VoxtralRealtimeSttAgent(BaseSttAgent):
                             # The done never arrived (lost closing commit or
                             # event desync); waiting longer only buffers more
                             # audio. Resync and open ungated on the next frame.
+                            #
+                            # Drop the starts still queued along with the
+                            # counter. A segment that streamed has already had
+                            # its start popped at its first delta, so what is
+                            # left belongs to the segments this timeout is
+                            # giving up on. Keeping them would pair every later
+                            # segment with its predecessor's start — a wrong
+                            # BBB transcriptId, for the life of the connection,
+                            # and silently: _pop_segment_start warns about an
+                            # empty queue, never an over-full one.
+                            #
+                            # The trade: a server merely slow past the timeout
+                            # still owes deltas for a start just discarded, so
+                            # that one segment falls back to a wall-clock stamp
+                            # — loudly, from _pop_segment_start. A first delta
+                            # arrives ~0.6 s after speech starts, so reaching
+                            # here means the segment is wedged, not slow.
+                            orphans = len(segment_starts)
+                            segment_starts.clear()
                             logging.warning(
                                 f"Voxtral: open gate timed out for "
                                 f"{participant.identity} with {outstanding} "
-                                f"transcription(s) outstanding — resyncing"
+                                f"transcription(s) outstanding — resyncing "
+                                f"(discarding {orphans} unpaired segment start(s))"
                             )
                             outstanding = 0
 
